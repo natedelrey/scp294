@@ -43,23 +43,27 @@ const DrinkSchema = {
       enum: ["NONE","WARMTH","COOLING","SPEED_SMALL","JUMP_SMALL","GLOW","SHRINK_VFX","GROW_VFX","BURP","EXPLODE"]
     },
 
-    effectParams: {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        duration: { type: "number", minimum: 0.5, maximum: 15 },
-        speedMultiplier: { type: "number", minimum: 0.5, maximum: 2.0 },
-        jumpBoost: { type: "number", minimum: 0, maximum: 50 },
-        glowBrightness: { type: "number", minimum: 0, maximum: 10 },
-        power: { type: "number", minimum: 0, maximum: 1 },     // EXPLODE cartoon strength
-        radius: { type: "number", minimum: 0, maximum: 12 }    // EXPLODE VFX radius
-      }
-    },
+  effectParams: {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    // generic
+    duration:        { type: "number", minimum: 0.5, maximum: 15 },
 
-    message: { type: "string", maxLength: 120 }
+    // SPEED/JUMP
+    speedMultiplier: { type: "number", minimum: 0.5, maximum: 2.0 },
+    jumpBoost:       { type: "number", minimum: 0,   maximum: 50  },
+
+    // GLOW
+    glowBrightness:  { type: "number", minimum: 0,   maximum: 10  },
+
+    // EXPLODE
+    power:           { type: "number", minimum: 0,   maximum: 1   },
+    radius:          { type: "number", minimum: 0,   maximum: 12  }
   },
-  required: ["displayName","colorHex","temperature","container","visual","tasteNotes","effectId","message"]
-};
+  // 👇 Strict mode needs this: include EVERY key listed above
+  required: ["duration","speedMultiplier","jumpBoost","glowBrightness","power","radius"]
+},
 
 // ---- helpers ----
 const FALLBACK_OK = (q) => ({
