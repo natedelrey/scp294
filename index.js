@@ -1,4 +1,4 @@
-// index.js — SCP-294 backend (Railway, ESM) — fixed for Responses API (text.format)
+// index.js — SCP-294 backend (Railway, ESM) — fixed schema 'required'
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
@@ -17,7 +17,7 @@ const SYSTEM_PROMPT = `You are SCP-294's describer. Given a requested drink name
 Never invent new effectIds. Avoid real alcohol/drugs/poisons; if requested, map to "NONE" and include a safety-themed, in-universe message.
 Use plausible colors and containers; keep it PG-13.`;
 
-// JSON schema the model must follow
+// ✅ JSON schema — required includes EVERY key in properties (including tasteNotes)
 const DrinkSchema = {
   type: "object",
   additionalProperties: false,
@@ -29,17 +29,22 @@ const DrinkSchema = {
     visual: {
       type: "object",
       additionalProperties: false,
-      properties: { foam:{type:"boolean"}, bubbles:{type:"boolean"}, steam:{type:"boolean"} },
+      properties: {
+        foam: { type: "boolean" },
+        bubbles: { type: "boolean" },
+        steam: { type: "boolean" }
+      },
       required: ["foam","bubbles","steam"]
     },
     tasteNotes: { type: "array", items: { type: "string" }, maxItems: 3 },
     effectId: { type: "string", enum: ["NONE","WARMTH","COOLING","SPEED_SMALL","JUMP_SMALL","GLOW","SHRINK_VFX","GROW_VFX","BURP"] },
     message: { type: "string", maxLength: 120 }
   },
-  required: ["displayName","colorHex","temperature","container","visual","effectId","message"]
+  // 👇 include EVERY key from properties here:
+  required: ["displayName","colorHex","temperature","container","visual","tasteNotes","effectId","message"]
 };
 
-// quick GET to check the route from a browser
+// Quick browser check
 app.get("/api/scp294", (_req, res) => {
   res.json({ ok: true, hint: "POST here with JSON: { query: 'lemonade' }" });
 });
@@ -51,7 +56,7 @@ app.post("/api/scp294", async (req, res) => {
     const query = String(req.body?.query ?? "").slice(0, 50).trim();
     if (!query) return res.status(400).json({ error: "Missing query" });
 
-    // Optional moderation gate; returns a safe refusal if flagged
+    // Optional moderation gate
     try {
       const mod = await openai.moderations.create({
         model: "omni-moderation-latest",
@@ -73,8 +78,7 @@ app.post("/api/scp294", async (req, res) => {
       console.warn("Moderation warning:", e?.message || e);
     }
 
-    // ✅ Responses API structured output:
-    // Put schema INSIDE text.format, and include format.name
+    // Responses API: structured output under text.format
     const r = await openai.responses.create({
       model: "gpt-4o-mini",
       instructions: SYSTEM_PROMPT,
@@ -82,8 +86,8 @@ app.post("/api/scp294", async (req, res) => {
       text: {
         format: {
           type: "json_schema",
-          name: "Drink",          // <-- required
-          schema: DrinkSchema,     // <-- your schema
+          name: "Drink",
+          schema: DrinkSchema,
           strict: true
         }
       }
@@ -110,7 +114,7 @@ app.post("/api/scp294", async (req, res) => {
     res.json(data);
   } catch (e) {
     console.error("SCP294 POST error:", e?.response?.data || e?.message || e);
-    // hard fallback you were seeing before
+    // hard fallback
     res.json({
       displayName: "Machine Coolant (Safe Replica)",
       colorHex: "#88E0FF",
