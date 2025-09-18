@@ -1,4 +1,4 @@
-// index.js — SCP-294 backend (Railway, ESM) | fast-fail + logs + structured output
+// index.js — SCP-294 backend (Railway, ESM) — robust JSON extraction + custom effects
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
@@ -12,12 +12,16 @@ app.use(cors({ origin: "*" }));
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const limiter = new RateLimiterMemory({ points: 20, duration: 120 }); // 20 req / 2 min
 
-const SYSTEM_PROMPT = `You are SCP-294's describer. Choose a SAFE in-game effect from this enum:
+// === Prompt tunes: force a concrete effect (whitelist) and small params ===
+const SYSTEM_PROMPT = `You are SCP-294's describer.
+Pick EXACTLY ONE safe in-game effect from:
 ["NONE","WARMTH","COOLING","SPEED_SMALL","JUMP_SMALL","GLOW","SHRINK_VFX","GROW_VFX","BURP","EXPLODE"].
-Return color/visuals and ONE effect with optional params. Never invent new effectIds.
-EXPLODE must be slapstick (no gore) and only affects the requesting player. Keep output PG-13.`;
+Return a short, fun message, a plausible color, and optional effectParams (bounded).
+- If user asks for harmful/illegal/NSFW: choose "NONE" and a refusal-flavored message.
+- "EXPLODE" is slapstick only (no gore), affects ONLY the requester.
+- Prefer variety: if request sounds energetic or explosive, use EXPLODE; if bright -> GLOW; if fast -> SPEED_SMALL; if floaty -> JUMP_SMALL; if cozy -> WARMTH; if chilly -> COOLING; otherwise use NONE.
+Respond STRICTLY with the schema; no extra keys.`;
 
-// Strict JSON schema (required includes every key)
 const DrinkSchema = {
   type: "object",
   additionalProperties: false,
@@ -33,10 +37,12 @@ const DrinkSchema = {
       required: ["foam","bubbles","steam"]
     },
     tasteNotes: { type: "array", items: { type: "string" }, maxItems: 3 },
+
     effectId: {
       type: "string",
       enum: ["NONE","WARMTH","COOLING","SPEED_SMALL","JUMP_SMALL","GLOW","SHRINK_VFX","GROW_VFX","BURP","EXPLODE"]
     },
+
     effectParams: {
       type: "object",
       additionalProperties: false,
@@ -45,16 +51,17 @@ const DrinkSchema = {
         speedMultiplier: { type: "number", minimum: 0.5, maximum: 2.0 },
         jumpBoost: { type: "number", minimum: 0, maximum: 50 },
         glowBrightness: { type: "number", minimum: 0, maximum: 10 },
-        power: { type: "number", minimum: 0, maximum: 1 },
-        radius: { type: "number", minimum: 0, maximum: 12 }
+        power: { type: "number", minimum: 0, maximum: 1 },     // EXPLODE cartoon strength
+        radius: { type: "number", minimum: 0, maximum: 12 }    // EXPLODE VFX radius
       }
     },
+
     message: { type: "string", maxLength: 120 }
   },
   required: ["displayName","colorHex","temperature","container","visual","tasteNotes","effectId","message"]
 };
 
-// ===== helpers =====
+// ---- helpers ----
 const FALLBACK_OK = (q) => ({
   displayName: q || "Generic Beverage",
   colorHex: "#A0C4FF",
@@ -75,12 +82,53 @@ function withTimeout(promise, ms, label) {
   ]);
 }
 
-// quick GET for browser sanity check
+// Grab the structured result regardless of where SDK puts it
+function extractDrinkStruct(r) {
+  // 1) Preferred shortcut some SDKs expose
+  if (r && r.output_parsed) return r.output_parsed;
+
+  // 2) Walk output[]/content[] looking for JSON-ish payloads
+  const out = r?.output;
+  if (Array.isArray(out)) {
+    for (const item of out) {
+      const content = item?.content;
+      if (Array.isArray(content)) {
+        for (const c of content) {
+          // Some SDKs put parsed object here:
+          if (c && typeof c.parsed === "object") return c.parsed;
+          if (c && typeof c.json === "object") return c.json; // sometimes named json
+          if (c?.type === "output_text" && typeof c.text === "string") {
+            const s = c.text.trim();
+            if (s.startsWith("{") && s.endsWith("}")) {
+              try { return JSON.parse(s); } catch {}
+            }
+            // try to yank the first JSON object from text
+            const m = s.match(/\{[\s\S]*\}/);
+            if (m) { try { return JSON.parse(m[0]); } catch {} }
+          }
+        }
+      }
+    }
+  }
+
+  // 3) Fallback to output_text root (some SDKs flatten this)
+  const t = r?.output_text;
+  if (typeof t === "string" && t.trim()) {
+    const s = t.trim();
+    if (s.startsWith("{") && s.endsWith("}")) { try { return JSON.parse(s); } catch {} }
+    const m = s.match(/\{[\s\S]*\}/);
+    if (m) { try { return JSON.parse(m[0]); } catch {} }
+  }
+
+  return null;
+}
+
+// quick GET to sanity-check in browser
 app.get("/api/scp294", (_req, res) => {
   res.json({ ok: true, hint: "POST here with JSON: { query: 'lemonade' }" });
 });
 
-// optional debug (does NOT leak key)
+// optional debug (does NOT leak the key)
 app.get("/api/debug", (_req, res) => {
   res.json({
     ok: true,
@@ -94,12 +142,11 @@ app.post("/api/scp294", async (req, res) => {
   const t0 = Date.now();
   try {
     await limiter.consume(req.ip);
+
     const query = String(req.body?.query ?? "").slice(0, 50).trim();
     if (!query) return res.status(400).json({ error: "Missing query" });
 
-    console.log(`[SCP294] POST start q="${query}"`);
-
-    // 1) Moderation (fast-fail, timeout 2000ms)
+    // 1) quick moderation (2s cap)
     try {
       const mod = await withTimeout(
         openai.moderations.create({ model: "omni-moderation-latest", input: query }),
@@ -107,7 +154,6 @@ app.post("/api/scp294", async (req, res) => {
         "moderation"
       );
       if (mod?.results?.[0]?.flagged) {
-        console.log("[SCP294] moderation: flagged");
         return res.json({
           displayName: "Unknown Liquid",
           colorHex: "#7F7F7F",
@@ -119,19 +165,17 @@ app.post("/api/scp294", async (req, res) => {
           message: "The machine refuses to dispense that request."
         });
       }
-      console.log("[SCP294] moderation: ok");
-    } catch (e) {
-      console.warn("[SCP294] moderation skipped:", e.message || e);
-    }
+    } catch (_) { /* non-fatal */ }
 
-    // 2) Structured output (timeout 6500ms)
-    let r;
+    // 2) ask model for structured drink (6.5s cap)
+    let resp;
     try {
-      r = await withTimeout(
+      resp = await withTimeout(
         openai.responses.create({
           model: "gpt-4o-mini",
           instructions: SYSTEM_PROMPT,
           input: `Request: ${query}`,
+          temperature: 0.2,
           text: {
             format: {
               type: "json_schema",
@@ -145,24 +189,38 @@ app.post("/api/scp294", async (req, res) => {
         "responses.create"
       );
     } catch (e) {
-      console.error("[SCP294] responses.create failed:", e.message || e);
-      return res.json(FALLBACK_OK(query)); // respond immediately (avoid 502)
-    }
-
-    const text = r.output_text ?? r.output?.[0]?.content?.[0]?.text ?? "{}";
-    let data;
-    try { data = JSON.parse(text); } catch { data = null; }
-
-    if (!data || !data.effectId) {
-      console.warn("[SCP294] parse failed; sending fallback");
+      console.error("[SCP294] responses.create failed:", e?.message || e);
       return res.json(FALLBACK_OK(query));
     }
 
-    console.log(`[SCP294] ok in ${Date.now()-t0}ms`);
-    res.json(data);
+    const data = extractDrinkStruct(resp);
+    if (!data || !data.effectId) {
+      console.warn("[SCP294] parse returned no effect; sending fallback");
+      return res.json(FALLBACK_OK(query));
+    }
+
+    // guardrails: clamp/strip unexpected fields just in case
+    const clean = {
+      displayName: String(data.displayName || query || "Beverage").slice(0, 40),
+      colorHex: /^#[0-9a-fA-F]{6}$/.test(String(data.colorHex)) ? data.colorHex : "#A0C4FF",
+      temperature: ["cold","cool","ambient","warm","hot"].includes(data.temperature) ? data.temperature : "ambient",
+      container: ["paper_cup","mug","glass","metal_cup"].includes(data.container) ? data.container : "paper_cup",
+      visual: {
+        foam: Boolean(data?.visual?.foam),
+        bubbles: Boolean(data?.visual?.bubbles),
+        steam: Boolean(data?.visual?.steam)
+      },
+      tasteNotes: Array.isArray(data.tasteNotes) ? data.tasteNotes.slice(0,3).map(String) : [],
+      effectId: ["NONE","WARMTH","COOLING","SPEED_SMALL","JUMP_SMALL","GLOW","SHRINK_VFX","GROW_VFX","BURP","EXPLODE"]
+        .includes(data.effectId) ? data.effectId : "NONE",
+      effectParams: typeof data.effectParams === "object" && data.effectParams ? data.effectParams : {},
+      message: String(data.message || "").slice(0, 120) || "The machine chirps pleasantly."
+    };
+
+    console.log(`[SCP294] ok "${clean.displayName}" → ${clean.effectId} in ${Date.now()-t0}ms`);
+    res.json(clean);
   } catch (e) {
     console.error("[SCP294] POST error:", e?.response?.data || e?.message || e);
-    // hard fallback
     res.json({
       displayName: "Machine Coolant (Safe Replica)",
       colorHex: "#88E0FF",
@@ -176,13 +234,11 @@ app.post("/api/scp294", async (req, res) => {
   }
 });
 
-// health
 app.get("/healthz", (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("SCP-294 backend on :" + PORT));
 
-// cosmetic: quiet the build probe logs
 process.on("SIGTERM", () => {
   console.log("Received SIGTERM (platform probe or redeploy). Exiting cleanly.");
   process.exit(0);
