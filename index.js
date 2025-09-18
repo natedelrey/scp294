@@ -12,17 +12,20 @@ app.use(cors({ origin: "*" }));
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const limiter = new RateLimiterMemory({ points: 20, duration: 120 }); // 20 req / 2 min
 
-// === Prompt: force a single whitelisted effect with small, safe params ===
+// === Prompt: always include effectParams with all fields (neutral defaults if not needed)
 const SYSTEM_PROMPT = `You are SCP-294's describer.
 Pick EXACTLY ONE safe in-game effect from:
 ["NONE","WARMTH","COOLING","SPEED_SMALL","JUMP_SMALL","GLOW","SHRINK_VFX","GROW_VFX","BURP","EXPLODE"].
-Return a short, fun message, a plausible color, and optional effectParams (bounded).
+Return a short, fun message, a plausible color, and ALWAYS include "effectParams" with ALL fields:
+{ duration, speedMultiplier, jumpBoost, glowBrightness, power, radius }.
+If a field isn't meaningful for the chosen effect, set a neutral default
+(e.g., duration=6, speedMultiplier=1, jumpBoost=0, glowBrightness=0, power=0, radius=0).
 - If user asks for harmful/illegal/NSFW: choose "NONE" and a refusal-flavored message.
 - "EXPLODE" is slapstick only (no gore), affects ONLY the requester.
-- Prefer variety: if request sounds energetic or explosive → EXPLODE; bright → GLOW; fast → SPEED_SMALL; floaty → JUMP_SMALL; cozy → WARMTH; chilly → COOLING; otherwise → NONE.
+- Prefer variety: energetic/explosive → EXPLODE; bright → GLOW; fast → SPEED_SMALL; floaty → JUMP_SMALL; cozy → WARMTH; chilly → COOLING; otherwise → NONE.
 Respond STRICTLY with the schema; no extra keys.`;
 
-// === Strict JSON schema (every object with properties has required[]) ===
+// === Strict JSON schema (every object with properties has required[]; root required includes EVERY key)
 const DrinkSchema = {
   type: "object",
   additionalProperties: false,
@@ -69,8 +72,8 @@ const DrinkSchema = {
 
     message: { type: "string", maxLength: 120 }
   },
-  // root required must include every property except effectParams (it's optional as a whole)
-  required: ["displayName","colorHex","temperature","container","visual","tasteNotes","effectId","message"]
+  // 👇 root required must include EVERY property (including effectParams)
+  required: ["displayName","colorHex","temperature","container","visual","tasteNotes","effectId","effectParams","message"]
 };
 
 // ---------- helpers ----------
@@ -130,17 +133,7 @@ app.get("/api/scp294", (_req, res) => {
   res.json({ ok: true, hint: "POST here with JSON: { query: 'lemonade' }" });
 });
 
-app.get("/api/debug", (_req, res) => {
-  res.json({
-    ok: true,
-    hasKey: Boolean(process.env.OPENAI_API_KEY),
-    uptime: process.uptime(),
-    env: process.env.RAILWAY_ENVIRONMENT || "unknown"
-  });
-});
-
 app.post("/api/scp294", async (req, res) => {
-  const t0 = Date.now();
   try {
     await limiter.consume(req.ip);
 
@@ -163,6 +156,7 @@ app.post("/api/scp294", async (req, res) => {
           visual: { foam: false, bubbles: false, steam: false },
           tasteNotes: ["neutral"],
           effectId: "NONE",
+          effectParams: { duration:6, speedMultiplier:1, jumpBoost:0, glowBrightness:0, power:0, radius:0 },
           message: "The machine refuses to dispense that request."
         });
       }
@@ -200,7 +194,8 @@ app.post("/api/scp294", async (req, res) => {
       return res.json(FALLBACK_OK(query));
     }
 
-    // Guardrails: clean/sanitize
+    // Guardrails: clean/sanitize + ensure effectParams present
+    const effectParams = (typeof data.effectParams === "object" && data.effectParams) ? data.effectParams : {};
     const clean = {
       displayName: String(data.displayName || query || "Beverage").slice(0, 40),
       colorHex: /^#[0-9a-fA-F]{6}$/.test(String(data.colorHex)) ? data.colorHex : "#A0C4FF",
@@ -214,11 +209,18 @@ app.post("/api/scp294", async (req, res) => {
       tasteNotes: Array.isArray(data.tasteNotes) ? data.tasteNotes.slice(0,3).map(String) : [],
       effectId: ["NONE","WARMTH","COOLING","SPEED_SMALL","JUMP_SMALL","GLOW","SHRINK_VFX","GROW_VFX","BURP","EXPLODE"]
         .includes(data.effectId) ? data.effectId : "NONE",
-      effectParams: (typeof data.effectParams === "object" && data.effectParams) ? data.effectParams : {},
+      effectParams: {
+        duration:        Number(effectParams.duration ?? 6),
+        speedMultiplier: Number(effectParams.speedMultiplier ?? 1),
+        jumpBoost:       Number(effectParams.jumpBoost ?? 0),
+        glowBrightness:  Number(effectParams.glowBrightness ?? 0),
+        power:           Number(effectParams.power ?? 0),
+        radius:          Number(effectParams.radius ?? 0)
+      },
       message: String(data.message || "").slice(0, 120) || "The machine chirps pleasantly."
     };
 
-    console.log(`[SCP294] ok "${clean.displayName}" → ${clean.effectId} in ${Date.now() - t0}ms`);
+    console.log(`[SCP294] ok "${clean.displayName}" → ${clean.effectId}`);
     res.json(clean);
   } catch (e) {
     console.error("[SCP294] POST error:", e?.response?.data || e?.message || e);
@@ -230,6 +232,7 @@ app.post("/api/scp294", async (req, res) => {
       visual: { foam: false, bubbles: false, steam: false },
       tasteNotes: ["minty"],
       effectId: "COOLING",
+      effectParams: { duration:6, speedMultiplier:1, jumpBoost:0, glowBrightness:0, power:0, radius:0 },
       message: "Failsafe blend dispensed."
     });
   }
