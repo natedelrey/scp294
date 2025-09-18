@@ -1,4 +1,4 @@
-// index.js — SCP-294 backend (Railway, ESM) — robust JSON extraction + custom effects
+// index.js — SCP-294 backend (Railway, ESM) — structured output + custom effects + timeouts
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
@@ -12,16 +12,17 @@ app.use(cors({ origin: "*" }));
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const limiter = new RateLimiterMemory({ points: 20, duration: 120 }); // 20 req / 2 min
 
-// === Prompt tunes: force a concrete effect (whitelist) and small params ===
+// === Prompt: force a single whitelisted effect with small, safe params ===
 const SYSTEM_PROMPT = `You are SCP-294's describer.
 Pick EXACTLY ONE safe in-game effect from:
 ["NONE","WARMTH","COOLING","SPEED_SMALL","JUMP_SMALL","GLOW","SHRINK_VFX","GROW_VFX","BURP","EXPLODE"].
 Return a short, fun message, a plausible color, and optional effectParams (bounded).
 - If user asks for harmful/illegal/NSFW: choose "NONE" and a refusal-flavored message.
 - "EXPLODE" is slapstick only (no gore), affects ONLY the requester.
-- Prefer variety: if request sounds energetic or explosive, use EXPLODE; if bright -> GLOW; if fast -> SPEED_SMALL; if floaty -> JUMP_SMALL; if cozy -> WARMTH; if chilly -> COOLING; otherwise use NONE.
+- Prefer variety: if request sounds energetic or explosive → EXPLODE; bright → GLOW; fast → SPEED_SMALL; floaty → JUMP_SMALL; cozy → WARMTH; chilly → COOLING; otherwise → NONE.
 Respond STRICTLY with the schema; no extra keys.`;
 
+// === Strict JSON schema (every object with properties has required[]) ===
 const DrinkSchema = {
   type: "object",
   additionalProperties: false,
@@ -33,7 +34,11 @@ const DrinkSchema = {
     visual: {
       type: "object",
       additionalProperties: false,
-      properties: { foam:{type:"boolean"}, bubbles:{type:"boolean"}, steam:{type:"boolean"} },
+      properties: {
+        foam: { type: "boolean" },
+        bubbles: { type: "boolean" },
+        steam: { type: "boolean" }
+      },
       required: ["foam","bubbles","steam"]
     },
     tasteNotes: { type: "array", items: { type: "string" }, maxItems: 3 },
@@ -43,29 +48,32 @@ const DrinkSchema = {
       enum: ["NONE","WARMTH","COOLING","SPEED_SMALL","JUMP_SMALL","GLOW","SHRINK_VFX","GROW_VFX","BURP","EXPLODE"]
     },
 
-  effectParams: {
-  type: "object",
-  additionalProperties: false,
-  properties: {
-    // generic
-    duration:        { type: "number", minimum: 0.5, maximum: 15 },
+    effectParams: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        // generic
+        duration:        { type: "number", minimum: 0.5, maximum: 15 },
+        // SPEED/JUMP
+        speedMultiplier: { type: "number", minimum: 0.5, maximum: 2.0 },
+        jumpBoost:       { type: "number", minimum: 0,   maximum: 50  },
+        // GLOW
+        glowBrightness:  { type: "number", minimum: 0,   maximum: 10  },
+        // EXPLODE (cartoon)
+        power:           { type: "number", minimum: 0,   maximum: 1   },
+        radius:          { type: "number", minimum: 0,   maximum: 12  }
+      },
+      // strict mode wants every key listed here:
+      required: ["duration","speedMultiplier","jumpBoost","glowBrightness","power","radius"]
+    },
 
-    // SPEED/JUMP
-    speedMultiplier: { type: "number", minimum: 0.5, maximum: 2.0 },
-    jumpBoost:       { type: "number", minimum: 0,   maximum: 50  },
-
-    // GLOW
-    glowBrightness:  { type: "number", minimum: 0,   maximum: 10  },
-
-    // EXPLODE
-    power:           { type: "number", minimum: 0,   maximum: 1   },
-    radius:          { type: "number", minimum: 0,   maximum: 12  }
+    message: { type: "string", maxLength: 120 }
   },
-  // 👇 Strict mode needs this: include EVERY key listed above
-  required: ["duration","speedMultiplier","jumpBoost","glowBrightness","power","radius"]
-},
+  // root required must include every property except effectParams (it's optional as a whole)
+  required: ["displayName","colorHex","temperature","container","visual","tasteNotes","effectId","message"]
+};
 
-// ---- helpers ----
+// ---------- helpers ----------
 const FALLBACK_OK = (q) => ({
   displayName: q || "Generic Beverage",
   colorHex: "#A0C4FF",
@@ -86,27 +94,20 @@ function withTimeout(promise, ms, label) {
   ]);
 }
 
-// Grab the structured result regardless of where SDK puts it
+// Extract parsed JSON regardless of SDK shape
 function extractDrinkStruct(r) {
-  // 1) Preferred shortcut some SDKs expose
   if (r && r.output_parsed) return r.output_parsed;
-
-  // 2) Walk output[]/content[] looking for JSON-ish payloads
   const out = r?.output;
   if (Array.isArray(out)) {
     for (const item of out) {
       const content = item?.content;
       if (Array.isArray(content)) {
         for (const c of content) {
-          // Some SDKs put parsed object here:
           if (c && typeof c.parsed === "object") return c.parsed;
-          if (c && typeof c.json === "object") return c.json; // sometimes named json
+          if (c && typeof c.json === "object") return c.json;
           if (c?.type === "output_text" && typeof c.text === "string") {
             const s = c.text.trim();
-            if (s.startsWith("{") && s.endsWith("}")) {
-              try { return JSON.parse(s); } catch {}
-            }
-            // try to yank the first JSON object from text
+            if (s.startsWith("{") && s.endsWith("}")) { try { return JSON.parse(s); } catch {} }
             const m = s.match(/\{[\s\S]*\}/);
             if (m) { try { return JSON.parse(m[0]); } catch {} }
           }
@@ -114,8 +115,6 @@ function extractDrinkStruct(r) {
       }
     }
   }
-
-  // 3) Fallback to output_text root (some SDKs flatten this)
   const t = r?.output_text;
   if (typeof t === "string" && t.trim()) {
     const s = t.trim();
@@ -123,16 +122,14 @@ function extractDrinkStruct(r) {
     const m = s.match(/\{[\s\S]*\}/);
     if (m) { try { return JSON.parse(m[0]); } catch {} }
   }
-
   return null;
 }
 
-// quick GET to sanity-check in browser
+// ---------- routes ----------
 app.get("/api/scp294", (_req, res) => {
   res.json({ ok: true, hint: "POST here with JSON: { query: 'lemonade' }" });
 });
 
-// optional debug (does NOT leak the key)
 app.get("/api/debug", (_req, res) => {
   res.json({
     ok: true,
@@ -169,9 +166,9 @@ app.post("/api/scp294", async (req, res) => {
           message: "The machine refuses to dispense that request."
         });
       }
-    } catch (_) { /* non-fatal */ }
+    } catch (_) {}
 
-    // 2) ask model for structured drink (6.5s cap)
+    // 2) structured output (6.5s cap)
     let resp;
     try {
       resp = await withTimeout(
@@ -193,7 +190,7 @@ app.post("/api/scp294", async (req, res) => {
         "responses.create"
       );
     } catch (e) {
-      console.error("[SCP294] responses.create failed:", e?.message || e);
+      console.error("[SCP294] responses.create failed:", e?.response?.data || e?.message || e);
       return res.json(FALLBACK_OK(query));
     }
 
@@ -203,25 +200,25 @@ app.post("/api/scp294", async (req, res) => {
       return res.json(FALLBACK_OK(query));
     }
 
-    // guardrails: clamp/strip unexpected fields just in case
+    // Guardrails: clean/sanitize
     const clean = {
       displayName: String(data.displayName || query || "Beverage").slice(0, 40),
       colorHex: /^#[0-9a-fA-F]{6}$/.test(String(data.colorHex)) ? data.colorHex : "#A0C4FF",
       temperature: ["cold","cool","ambient","warm","hot"].includes(data.temperature) ? data.temperature : "ambient",
       container: ["paper_cup","mug","glass","metal_cup"].includes(data.container) ? data.container : "paper_cup",
       visual: {
-        foam: Boolean(data?.visual?.foam),
-        bubbles: Boolean(data?.visual?.bubbles),
-        steam: Boolean(data?.visual?.steam)
+        foam: !!(data?.visual?.foam),
+        bubbles: !!(data?.visual?.bubbles),
+        steam: !!(data?.visual?.steam)
       },
       tasteNotes: Array.isArray(data.tasteNotes) ? data.tasteNotes.slice(0,3).map(String) : [],
       effectId: ["NONE","WARMTH","COOLING","SPEED_SMALL","JUMP_SMALL","GLOW","SHRINK_VFX","GROW_VFX","BURP","EXPLODE"]
         .includes(data.effectId) ? data.effectId : "NONE",
-      effectParams: typeof data.effectParams === "object" && data.effectParams ? data.effectParams : {},
+      effectParams: (typeof data.effectParams === "object" && data.effectParams) ? data.effectParams : {},
       message: String(data.message || "").slice(0, 120) || "The machine chirps pleasantly."
     };
 
-    console.log(`[SCP294] ok "${clean.displayName}" → ${clean.effectId} in ${Date.now()-t0}ms`);
+    console.log(`[SCP294] ok "${clean.displayName}" → ${clean.effectId} in ${Date.now() - t0}ms`);
     res.json(clean);
   } catch (e) {
     console.error("[SCP294] POST error:", e?.response?.data || e?.message || e);
