@@ -1,20 +1,17 @@
-// index.js — SCP-294 backend (Railway, ESM)
+// index.js — SCP-294 backend (Railway, ESM, fixed for text.format)
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import OpenAI from "openai";
 import { RateLimiterMemory } from "rate-limiter-flexible";
 
-// --- express app FIRST ---
 const app = express();
 app.use(express.json({ limit: "512kb" }));
 app.use(cors({ origin: "*" }));
 
-// --- OpenAI + rate limit ---
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const limiter = new RateLimiterMemory({ points: 20, duration: 120 }); // 20 req / 2 min
 
-// --- helpers ---
 const SYSTEM_PROMPT = `You are SCP-294's describer. Given a requested drink name, return ONLY harmless cosmetics and a SAFE effectId from this enum:
 ["NONE","WARMTH","COOLING","SPEED_SMALL","JUMP_SMALL","GLOW","SHRINK_VFX","GROW_VFX","BURP"].
 Never invent new effectIds. Avoid real alcohol/drugs/poisons; if requested, map to "NONE" and include a safety-themed, in-universe message.
@@ -41,12 +38,10 @@ const DrinkSchema = {
   required: ["displayName","colorHex","temperature","container","visual","effectId","message"]
 };
 
-// GET helper so you can open it in the browser
 app.get("/api/scp294", (_req, res) => {
   res.json({ ok: true, hint: "POST here with JSON: { query: 'lemonade' }" });
 });
 
-// Main POST Roblox calls
 app.post("/api/scp294", async (req, res) => {
   try {
     await limiter.consume(req.ip);
@@ -54,7 +49,7 @@ app.post("/api/scp294", async (req, res) => {
     const query = String(req.body?.query ?? "").slice(0, 50).trim();
     if (!query) return res.status(400).json({ error: "Missing query" });
 
-    // Optional moderation (non-fatal if it errors)
+    // (Optional) Moderation; if it errors we just continue
     try {
       const mod = await openai.moderations.create({
         model: "omni-moderation-latest",
@@ -76,16 +71,22 @@ app.post("/api/scp294", async (req, res) => {
       console.warn("Moderation warning:", e?.message || e);
     }
 
-    const resp = await openai.responses.create({
+    // ⚠️ New Responses API: use text.format instead of response_format
+    const r = await openai.responses.create({
       model: "gpt-4o-mini",
       input: [
         { role: "system", content: SYSTEM_PROMPT },
         { role: "user", content: `Request: ${query}` }
       ],
-      response_format: { type: "json_schema", json_schema: { name: "Drink", schema: DrinkSchema, strict: true } }
+      text: {                                   // <-- new block
+        format: "json_schema",
+        json_schema: { name: "Drink", schema: DrinkSchema, strict: true }
+      }
     });
 
-    const text = resp.output?.[0]?.content?.[0]?.text ?? "{}";
+    // Convenient helper is available; fall back to nested path just in case
+    const text = r.output_text ?? r.output?.[0]?.content?.[0]?.text ?? "{}";
+
     let data;
     try { data = JSON.parse(text); } catch { data = null; }
 
@@ -118,9 +119,7 @@ app.post("/api/scp294", async (req, res) => {
   }
 });
 
-// health check
 app.get("/healthz", (_req, res) => res.json({ ok: true }));
 
-// listen
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("SCP-294 backend on :" + PORT));
