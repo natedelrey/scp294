@@ -1,4 +1,4 @@
-// index.js — SCP-294 backend (Railway, ESM, Responses API with text.format ✅)
+// index.js — SCP-294 backend (Railway, ESM) — fixed for Responses API (text.format)
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
@@ -16,11 +16,6 @@ const SYSTEM_PROMPT = `You are SCP-294's describer. Given a requested drink name
 ["NONE","WARMTH","COOLING","SPEED_SMALL","JUMP_SMALL","GLOW","SHRINK_VFX","GROW_VFX","BURP"].
 Never invent new effectIds. Avoid real alcohol/drugs/poisons; if requested, map to "NONE" and include a safety-themed, in-universe message.
 Use plausible colors and containers; keep it PG-13.`;
-
-// Simple browser sanity check
-app.get("/api/scp294", (_req, res) => {
-  res.json({ ok: true, hint: "POST here with JSON: { query: 'lemonade' }" });
-});
 
 // JSON schema the model must follow
 const DrinkSchema = {
@@ -44,6 +39,11 @@ const DrinkSchema = {
   required: ["displayName","colorHex","temperature","container","visual","effectId","message"]
 };
 
+// quick GET to check the route from a browser
+app.get("/api/scp294", (_req, res) => {
+  res.json({ ok: true, hint: "POST here with JSON: { query: 'lemonade' }" });
+});
+
 app.post("/api/scp294", async (req, res) => {
   try {
     await limiter.consume(req.ip);
@@ -51,7 +51,7 @@ app.post("/api/scp294", async (req, res) => {
     const query = String(req.body?.query ?? "").slice(0, 50).trim();
     if (!query) return res.status(400).json({ error: "Missing query" });
 
-    // Optional: moderation; if flagged, return safe refusal
+    // Optional moderation gate; returns a safe refusal if flagged
     try {
       const mod = await openai.moderations.create({
         model: "omni-moderation-latest",
@@ -73,7 +73,8 @@ app.post("/api/scp294", async (req, res) => {
       console.warn("Moderation warning:", e?.message || e);
     }
 
-    // ✅ Responses API structured output: put json_schema INSIDE text.format
+    // ✅ Responses API structured output:
+    // Put schema INSIDE text.format, and include format.name
     const r = await openai.responses.create({
       model: "gpt-4o-mini",
       instructions: SYSTEM_PROMPT,
@@ -81,7 +82,9 @@ app.post("/api/scp294", async (req, res) => {
       text: {
         format: {
           type: "json_schema",
-          json_schema: { name: "Drink", schema: DrinkSchema, strict: true }
+          name: "Drink",          // <-- required
+          schema: DrinkSchema,     // <-- your schema
+          strict: true
         }
       }
     });
@@ -91,7 +94,7 @@ app.post("/api/scp294", async (req, res) => {
     try { data = JSON.parse(text); } catch { data = null; }
 
     if (!data || !data.effectId) {
-      // gentle fallback if parsing failed
+      // gentle fallback if parsing fails
       data = {
         displayName: query || "Generic Beverage",
         colorHex: "#A0C4FF",
@@ -107,7 +110,7 @@ app.post("/api/scp294", async (req, res) => {
     res.json(data);
   } catch (e) {
     console.error("SCP294 POST error:", e?.response?.data || e?.message || e);
-    // hard fallback (what you saw as “Machine Coolant”)
+    // hard fallback you were seeing before
     res.json({
       displayName: "Machine Coolant (Safe Replica)",
       colorHex: "#88E0FF",
